@@ -22,6 +22,7 @@
 #include <tensorview/tensorview.h>
 #include <type_traits>
 #include <utility/timer.h>
+#include <cuhash/hash_table.h>
 
 namespace spconv {
 namespace functor {
@@ -45,15 +46,15 @@ struct CreateConvIndicePairFunctorP1<tv::GPU, Index, IndexGrid, NDim> {
       return 0;
     // auto timer = spconv::CudaContextTimer<>();
     if (transpose)
-      prepareDeConvIndicePairsKernel<Index, IndexGrid, NDim, 256>
+      prepareDeConvIndicePairsKernel<Index, IndexGrid, NDim, 4096>
           <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
-             d.stream()>>>(indicesIn, indicesOut, gridsOut, indicePairs,
+             d.getStream()>>>(indicesIn, indicesOut, gridsOut, indicePairs,
                            indiceNum, indicePairUnique, kernelSize, stride,
                            padding, dilation, outSpatialShape);
     else
-      prepareIndicePairsKernel<Index, IndexGrid, NDim, 256>
+      prepareIndicePairsKernel<Index, IndexGrid, NDim, 4096>
           <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
-             d.stream()>>>(indicesIn, indicesOut, gridsOut, indicePairs,
+             d.getStream()>>>(indicesIn, indicesOut, gridsOut, indicePairs,
                            indiceNum, indicePairUnique, kernelSize, stride,
                            padding, dilation, outSpatialShape);
     TV_CHECK_CUDA_ERR();
@@ -71,28 +72,65 @@ struct CreateConvIndicePairFunctorP2<tv::GPU, Index, IndexGrid, NDim> {
                    tv::TensorView<Index> indiceNum,
                    tv::TensorView<Index> indicePairUnique,
                    const tv::SimpleVector<Index, NDim> outSpatialShape,
-                   bool transpose, bool resetGrid) {
+                   bool transpose, bool resetGrid, bool useHash) {
     Index batchSize = gridsOut.dim(0);
     auto kernelVolume = indicePairs.dim(0);
     auto numActIn = indicesIn.dim(0);
     if (numActIn == 0)
       return 0;
-    Index numAct = indicePairUnique.dim(0) - 1;
-    assignGridAndIndiceOutKernel<Index, IndexGrid, NDim>
-        <<<tv::launch::getBlocks(numAct), tv::launch::CUDA_NUM_THREADS, 0,
-           d.stream()>>>(indicesOut, gridsOut, numAct, indicePairs,
-                         indicePairUnique, outSpatialShape, batchSize);
-    TV_CHECK_CUDA_ERR();
-    assignIndicePairsKernel<Index, IndexGrid, NDim>
-        <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
-           d.stream()>>>(indicesOut, gridsOut, numActIn, indicePairs,
-                         indicePairUnique, outSpatialShape);
-    TV_CHECK_CUDA_ERR();
-    if (resetGrid) {
+    // after unique, there is a std::numeric_limits<int>::max() in the end of indicePairUnique
+    Index numAct = indicePairUnique.dim(0) - 1; 
+    if (useHash){
+      auto table = cuhash::HashTable();
+      // std::cout << "create " << numAct << " size table..." << std::endl;
+      table.Initialize(numAct, 2.0, 4);
+      unsigned *d_values = nullptr;
+      cudaMalloc((void**)&d_values, sizeof(unsigned) * numAct);
+      TV_CHECK_CUDA_ERR_V2("cudaMalloc failed");
+      arangeKernel<unsigned><<<tv::launch::getBlocks(numAct), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(d_values, numAct);
+      bool res = table.Build(numAct, reinterpret_cast<unsigned*>(indicePairUnique.data()), 
+                d_values);
+      cudaFree(d_values);
+      if (!res){
+        return -1; //use -1 to tell outside use CPU implementation
+      }
+      assignIndiceOutKernel<Index, NDim>
+          <<<tv::launch::getBlocks(numAct), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesOut, numAct,
+                          indicePairUnique, outSpatialShape, batchSize);
+      TV_CHECK_CUDA_ERR_V2("assignGridAndIndiceOutKernel failed");
+      auto tableSize = table.get_table_size();
+      auto tableData = table.data();
+      auto constants = table.get_constants_4();
+      auto stash_constants = table.get_stash_constants();
+      auto stash_count = table.get_stash_count();
+      assignIndicePairsHashKernel<Index, IndexGrid, NDim>
+          <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesOut, numActIn, indicePairs,
+                          indicePairUnique,
+                          tableSize, tableData, constants, stash_constants,
+                          stash_count);
+      TV_CHECK_CUDA_ERR_V2("assignIndicePairsKernel failed");
+    }else{
+      assignGridAndIndiceOutKernel<Index, IndexGrid, NDim>
+          <<<tv::launch::getBlocks(numAct), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesOut, gridsOut, numAct, indicePairs,
+                          indicePairUnique, outSpatialShape, batchSize);
+      TV_CHECK_CUDA_ERR_V2("assignGridAndIndiceOutKernel failed");
+      assignIndicePairsKernel<Index, IndexGrid, NDim>
+          <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesOut, gridsOut, numActIn, indicePairs,
+                          indicePairUnique, outSpatialShape);
+      TV_CHECK_CUDA_ERR_V2("assignIndicePairsKernel failed");
+
+    }
+
+    if (resetGrid && (!useHash)) {
       resetGridKernel<Index, IndexGrid, NDim>
           <<<tv::launch::getBlocks(numAct), tv::launch::CUDA_NUM_THREADS, 0,
-             d.stream()>>>(indicePairUnique.data(), gridsOut, numAct);
-      TV_CHECK_CUDA_ERR();
+             d.getStream()>>>(indicePairUnique.data(), gridsOut, numAct);
+      TV_CHECK_CUDA_ERR_V2("resetGridKernel failed");
     }
     return numAct;
   }
@@ -109,25 +147,56 @@ struct CreateSubMIndicePairFunctor<tv::GPU, Index, IndexGrid, NDim> {
                    const tv::SimpleVector<Index, NDim> padding,
                    const tv::SimpleVector<Index, NDim> dilation,
                    const tv::SimpleVector<Index, NDim> outSpatialShape,
-                   bool transpose, bool resetGrid) {
+                   bool transpose, bool resetGrid, bool useHash) {
     auto numActIn = indicesIn.dim(0);
     if (numActIn == 0)
       return 0;
     // auto timer = spconv::CudaContextTimer<>();
-    prepareSubMGridKernel<Index, IndexGrid, NDim>
-        <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
-           d.stream()>>>(indicesIn, gridsOut, outSpatialShape);
-    TV_CHECK_CUDA_ERR();
-    getSubMIndicePairsKernel<Index, IndexGrid, NDim>
-        <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
-           d.stream()>>>(indicesIn, gridsOut, indicePairs, indiceNum,
-                         kernelSize, stride, padding, dilation, outSpatialShape);
-    TV_CHECK_CUDA_ERR();
+    if (useHash){
+      auto table = cuhash::HashTable();
+      // std::cout << "subm create " << numActIn << " size table..." << std::endl;
+      table.Initialize(numActIn, 2.0, 4);
+      unsigned *d_keyvalues = nullptr;
+      cudaMalloc((void**)&d_keyvalues, sizeof(unsigned) * numActIn * 2);
+      unsigned *d_values = d_keyvalues + numActIn;
+      prepareSubMHashKernel<Index, NDim>
+          <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesIn, d_keyvalues, d_values, outSpatialShape);
+      TV_CHECK_CUDA_ERR_V2("prepareSubMHashKernel failed");
+      bool res = table.Build(numActIn, reinterpret_cast<unsigned*>(d_keyvalues), 
+                reinterpret_cast<unsigned*>(d_values));
+      cudaFree(d_keyvalues);
+      if (!res){
+        return -1; //use -1 to tell outside use CPU implementation
+      }
+      auto tableSize = table.get_table_size();
+      auto tableData = table.data();
+      auto constants = table.get_constants_4();
+      auto stash_constants = table.get_stash_constants();
+      auto stash_count = table.get_stash_count();
+      getSubMIndicePairsHashKernel<Index, NDim, 4096>
+          <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesIn, indicePairs, indiceNum,
+                          kernelSize, stride, padding, dilation, outSpatialShape,
+                          tableSize, tableData, constants, stash_constants,
+                          stash_count);
+      TV_CHECK_CUDA_ERR_V2("getSubMIndicePairsHashKernel failed");
+    }else{
+      prepareSubMGridKernel<Index, IndexGrid, NDim>
+          <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesIn, gridsOut, outSpatialShape);
+      TV_CHECK_CUDA_ERR();
+      getSubMIndicePairsKernel<Index, IndexGrid, NDim, 4096>
+          <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
+            d.getStream()>>>(indicesIn, gridsOut, indicePairs, indiceNum,
+                          kernelSize, stride, padding, dilation, outSpatialShape);
+      TV_CHECK_CUDA_ERR();
+    }
     // std::cout << "subm gene time " << timer.report() / 1000.0 << std::endl;
-    if (resetGrid) {
+    if (resetGrid && (!useHash)) {
       resetGridSubMKernel<Index, IndexGrid, NDim>
           <<<tv::launch::getBlocks(numActIn), tv::launch::CUDA_NUM_THREADS, 0,
-             d.stream()>>>(indicesIn.data(), gridsOut, outSpatialShape, numActIn);
+             d.getStream()>>>(indicesIn.data(), gridsOut, outSpatialShape, numActIn);
       TV_CHECK_CUDA_ERR();
     }
     return numActIn;

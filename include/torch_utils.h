@@ -16,16 +16,19 @@
 #include <tensorview/tensorview.h>
 #include <torch/script.h>
 #include <ATen/ATen.h>
+#ifdef SPCONV_CUDA
 #include <ATen/cuda/CUDAContext.h>
+#endif
 
 namespace tv {
-
+  
+#ifdef SPCONV_CUDA
 struct TorchGPU: public tv::GPU {
-  TorchGPU(){
-    mStream = at::cuda::getCurrentCUDAStream();
+  virtual cudaStream_t getStream() const override {
+    return at::cuda::getCurrentCUDAStream();
   }
 };
-
+#endif
 template <typename T> void check_torch_dtype(const torch::Tensor &tensor) {
   switch (tensor.type().scalarType()) {
   case at::ScalarType::Double: {
@@ -48,10 +51,39 @@ template <typename T> void check_torch_dtype(const torch::Tensor &tensor) {
     TV_ASSERT_RT_ERR(val, "error");
     break;
   }
-
+  case at::ScalarType::Long: {
+    auto val = std::is_same<std::remove_const_t<T>, long>::value;
+    TV_ASSERT_RT_ERR(val, "error");
+    break;
+  }
   default:
     TV_ASSERT_RT_ERR(false, "error");
   }
+}
+
+template <typename T>
+constexpr auto type2torch(T val=T()) -> decltype(torch::kInt32){
+  TV_ASSERT_RT_ERR(false, "unknown type");
+}
+
+template <>
+constexpr auto type2torch(int val) -> decltype(torch::kInt32){
+  return torch::kInt32;
+}
+
+template <>
+constexpr auto type2torch(long val) -> decltype(torch::kInt32){
+  return torch::kInt64;
+}
+
+template <>
+constexpr auto type2torch(float val) -> decltype(torch::kInt32){
+  return torch::kFloat32;
+}
+
+template <>
+constexpr auto type2torch(double val) -> decltype(torch::kInt32){
+  return torch::kFloat64;
 }
 
 template <typename T>
