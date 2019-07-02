@@ -65,6 +65,10 @@ class SparseConvTensor(object):
     def spatial_size(self):
         return np.prod(self.spatial_shape)
 
+    @property
+    def shape(self):
+        return self.spatial_shape
+
     def find_indice_pair(self, key):
         if key is None:
             return None 
